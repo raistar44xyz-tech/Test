@@ -500,14 +500,15 @@ def generate_nftoken(cookies: dict) -> dict:
     netflix_id = cookies.get("NetflixId") or cookies.get("netflixId")
     if not netflix_id:
         return {"success": False, "error": "NetflixId cookie not found"}
-    proxy_dict = _proxy_manager.get_proxies_dict() if _PROXY_ENABLED and _proxy_manager else None
+    # NFToken API is Netflix's iOS endpoint — always call DIRECT (no proxy).
+    # Free/datacenter proxies return HTTP 500 from this endpoint; paid proxies
+    # happen to work but a direct call is faster and more reliable for all cases.
     try:
         resp = requests.get(
             NFTOKEN_API_URL,
             params=NFTOKEN_PARAMS,
             headers={**NFTOKEN_HEADERS, "Cookie": f"NetflixId={netflix_id}"},
-            proxies=proxy_dict,
-            timeout=8,
+            timeout=10,
         )
         if resp.status_code != 200:
             return {"success": False, "error": f"API returned HTTP {resp.status_code}"}
@@ -525,8 +526,6 @@ def generate_nftoken(cookies: dict) -> dict:
             "error": None,
         }
     except requests.exceptions.Timeout:
-        if proxy_dict and _proxy_manager:
-            _proxy_manager.mark_failure(proxy_dict.get("https", ""))
         return {"success": False, "error": "NFToken request timed out"}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1152,7 +1151,7 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
             f_nft     = pool.submit(_fetch_nftoken)
             acct_status, acct_text = f_account.result()
             try:
-                nft_result = f_nft.result(timeout=1.5)
+                nft_result = f_nft.result(timeout=6.0)
             except _cf.TimeoutError:
                 nft_result = {"success": False, "error": "generating…"}
             finally:
