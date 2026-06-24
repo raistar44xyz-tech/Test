@@ -30,6 +30,7 @@ from telegram.constants import ParseMode
 from checker import check_cookie
 import stats as stats_tracker
 from dashboard import start_dashboard
+import mongodb_store
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -1792,7 +1793,7 @@ def _proxy_panel_text() -> str:
             lines.append(f"  <code>{i+1}. {short}</code>")
         lines.append("")
         lines.append("<i>⏱ Sources auto-refresh every 60 s in background.</i>")
-        lines.append("<i>☠️ Dead proxies are auto-removed after 3 failures.</i>")
+        lines.append("<i>☠️ Dead proxies are auto-removed immediately on rate-limit/timeout.</i>")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
@@ -1800,6 +1801,7 @@ def _proxy_panel_text() -> str:
 
 def _proxy_panel_markup(pm) -> InlineKeyboardMarkup:
     toggle_label = "🔴 Turn OFF" if pm.enabled else "🟢 Turn ON"
+    cpw_label = "🔴 Proxy ChangePW: OFF" if not pm.changepw_proxy_enabled else "🟢 Proxy ChangePW: ON"
     rows = [
         [
             InlineKeyboardButton(toggle_label,          callback_data="proxy:toggle"),
@@ -1808,6 +1810,9 @@ def _proxy_panel_markup(pm) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📥 Add Source URL",   callback_data="proxy:importurl"),
             InlineKeyboardButton("🔄 Re-fetch Now",     callback_data="proxy:refreshsources"),
+        ],
+        [
+            InlineKeyboardButton(cpw_label,             callback_data="proxy:togglechangepw"),
         ],
     ]
     if pm.count:
@@ -1942,6 +1947,11 @@ async def proxy_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "proxy:clear":
         pm.clear_proxies()
+
+    elif action == "proxy:togglechangepw":
+        new_val = pm.toggle_changepw_proxy()
+        state = "ON ✅" if new_val else "OFF 🔴"
+        await query.answer(f"Password Change proxy: {state}", show_alert=False)
 
     elif action == "proxy:refresh":
         pass
@@ -2743,6 +2753,8 @@ async def process_cookie_sets(
 
             user_id = update.effective_user.id if update.effective_user else 0
             stats_tracker.record_check(status, user_id=user_id, source=src)
+            if status in ("hit", "free", "on_hold"):
+                mongodb_store.save_hit(result, user_id=user_id, source=src)
             result["_source"] = src
 
             # Single-check: always show full card.

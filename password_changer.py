@@ -91,7 +91,7 @@ def _new_uuid() -> str:
 
 
 def _get_proxy() -> dict | None:
-    if _PROXY_ENABLED and _proxy_manager:
+    if _PROXY_ENABLED and _proxy_manager and _proxy_manager.changepw_proxy_enabled:
         return _proxy_manager.get_proxies_dict()
     return None
 

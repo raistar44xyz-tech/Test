@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _DB_FILE = Path("proxy_pool.db")
 _AUTO_REFRESH_INTERVAL = 60        # seconds between source re-fetches
 _HEALTH_CHECK_INTERVAL = 120       # seconds between full pool health checks
-_MAX_FAILURES = 3                  # consecutive failures before permanent removal
+_MAX_FAILURES = 2                  # consecutive failures before permanent removal
 _SOCKET_TIMEOUT = 5                # seconds for socket health-check
 _FETCH_TIMEOUT = 20                # seconds for HTTP source fetch
 
@@ -105,6 +105,9 @@ def _init_db() -> None:
         """)
         conn.execute(
             "INSERT OR IGNORE INTO config (key, value) VALUES ('enabled', '0')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES ('changepw_proxy', '0')"
         )
 
 
@@ -207,6 +210,26 @@ class ProxyManager:
             ).fetchone()
         if row and (row[0] >= _MAX_FAILURES or force_remove):
             self._permanently_remove(url)
+
+    def mark_failure(self, url: str, hard: bool = False) -> None:
+        """
+        Record a failure for a proxy.
+        hard=True  → immediately remove (use for 429, timeout, connection error).
+        hard=False → increment counter; remove after _MAX_FAILURES (use for login-page ambiguity).
+        """
+        if not url:
+            return
+        self._increment_failure(url, force_remove=hard)
+
+    def mark_success(self, url: str) -> None:
+        """Reset failure counter and record last successful use."""
+        if not url:
+            return
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE proxies SET fail_count = 0, last_ok = ? WHERE url = ?",
+                (time.time(), url),
+            )
 
     def _permanently_remove(self, url: str) -> None:
         with _get_conn() as conn:
@@ -417,10 +440,31 @@ class ProxyManager:
             url = available[self._idx]
         return {"http": url, "https": url}
 
-    def mark_failure(self, url: str) -> None:
-        """Called by checker.py when a request through this proxy fails."""
-        if url:
-            self._increment_failure(url)
+    # ── Password-change proxy setting ────────────────────────────────────
+
+    @property
+    def changepw_proxy_enabled(self) -> bool:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key='changepw_proxy'"
+            ).fetchone()
+        return bool(int(row[0])) if row else False
+
+    def toggle_changepw_proxy(self) -> bool:
+        new_val = not self.changepw_proxy_enabled
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('changepw_proxy', ?)",
+                ("1" if new_val else "0",),
+            )
+        return new_val
+
+    def set_changepw_proxy_enabled(self, val: bool) -> None:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('changepw_proxy', ?)",
+                ("1" if val else "0",),
+            )
 
     # ── Display ──────────────────────────────────────────────────────────
 

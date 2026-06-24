@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Bot runtime files
+admin_id.txt
+proxies.json
+zipFile.zip
+*.zip
+*.log
+
+# Replit-specific
+.replit
+replit.nix
+.cache/
+.agents/
+.local/
+
+# Environment
+.env
+.env.*
+
+# Python venv
+venv/
+env/
+.venv/
