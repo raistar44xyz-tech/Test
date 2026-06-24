@@ -1045,7 +1045,7 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
             "message": f"No Netflix session cookies found. Got: {', '.join(list(cookies.keys())[:8])}",
         }
 
-    _timeout = 8 if bulk_mode else 12
+    _timeout = 5 if bulk_mode else 7
     session, using_curl = _make_session(bulk_mode)
 
     # ── Fetch membership page (+ optional parallel NFToken) ───────────────────
@@ -1053,88 +1053,110 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
 
     def _fetch_account():
         """
-        Fetch /account/membership with smart proxy rotation.
+        Fetch /account/membership using a parallel proxy race.
 
-        Key behaviour:
-        - A FRESH proxy is fetched for every attempt so each retry uses a
-          different IP.  This is the fix for the false-negative bug where a
-          rate-limited proxy caused valid cookies to look invalid.
-        - Rate-limit (429) / timeout / connection error → hard-remove proxy,
-          get a new one, retry immediately (no sleep).
-        - Login page via proxy → soft-fail proxy, retry once with a new proxy
-          before declaring the cookie invalid.  (A login-page could mean the
-          proxy is blocked by Netflix, not that the cookie is expired.)
-        - Without proxy: single attempt in bulk mode, two in single mode.
+        When proxies are enabled: RACE_N proxies are tried simultaneously.
+        The first one that returns a valid response wins; the others are
+        discarded (they finish quickly due to the short timeout).
+        Dead/rate-limited proxies are marked and removed as they fail.
+
+        Direct mode: single attempt (bulk) or two sequential (single).
         """
         _proxy_active = _PROXY_ENABLED and _proxy_manager and _proxy_manager.enabled
+        RACE_N = 3  # proxies to race in parallel
 
-        urls = ["https://www.netflix.com/account/membership"]
-        if not bulk_mode:
-            urls.append("https://www.netflix.com/browse")
+        def _purl(pd):
+            return (pd.get("https") or pd.get("http") or "") if pd else ""
 
-        login_page_retried = False   # only one "ambiguous proxy" retry per check
+        def _one_attempt(proxy_dict, url):
+            """Single HTTP request. Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html)."""
+            try:
+                r = session.get(
+                    url,
+                    cookies=cookies,
+                    timeout=_timeout,
+                    allow_redirects=True,
+                    **({"proxies": proxy_dict} if proxy_dict else {}),
+                )
+                if _is_rate_limited(r.status_code, r.text):
+                    if proxy_dict and _proxy_manager:
+                        _proxy_manager.mark_failure(_purl(proxy_dict), hard=True)
+                    return "FAIL", ""
+                if r.status_code in (401, 403):
+                    return "INVALID", r.text
+                if _is_login_page(r.url, r.text):
+                    if proxy_dict and _proxy_manager:
+                        _proxy_manager.mark_failure(_purl(proxy_dict))
+                    return "LOGIN", r.text
+                if r.status_code == 200 and len(r.text) > 1000:
+                    if proxy_dict and _proxy_manager:
+                        _proxy_manager.mark_success(_purl(proxy_dict))
+                    return "OK", r.text
+                return "FAIL", ""
+            except Exception as exc:
+                logger.debug("_one_attempt error: %s", exc)
+                if proxy_dict and _proxy_manager:
+                    _proxy_manager.mark_failure(_purl(proxy_dict), hard=True)
+                return "FAIL", ""
 
-        for url in urls:
-            # With proxy active: try up to 2 different proxies.
-            # Direct mode: 1 attempt in bulk (speed), 2 in single (reliability).
-            max_attempts = 2 if (_proxy_active or not bulk_mode) else 1
+        def _race(url):
+            """
+            Race RACE_N proxies simultaneously; return first OK/INVALID result.
+            Falls back to direct if all proxies fail.
+            """
+            proxies = [_proxy_manager.get_proxies_dict() for _ in range(RACE_N)]
+            proxies = [p for p in proxies if p]
+            if not proxies:
+                return _one_attempt(None, url)
 
-            for attempt in range(max_attempts):
-                cur_proxy = (_proxy_manager.get_proxies_dict()
-                             if _proxy_active else None)
-
-                def _proxy_url(pd):
-                    return pd.get("https") or pd.get("http") or "" if pd else ""
-
-                try:
-                    r = session.get(
-                        url,
-                        cookies=cookies,
-                        timeout=_timeout,
-                        allow_redirects=True,
-                        **({"proxies": cur_proxy} if cur_proxy else {}),
-                    )
-
-                    # ── Rate-limit: proxy is banned → hard-remove, retry ─────
-                    if _is_rate_limited(r.status_code, r.text):
-                        logger.debug("Rate-limited via proxy, hard-removing and retrying")
-                        if cur_proxy and _proxy_manager:
-                            _proxy_manager.mark_failure(_proxy_url(cur_proxy), hard=True)
-                        if attempt < max_attempts - 1:
-                            continue
-                        break   # exhausted attempts for this URL
-
-                    # ── Auth failure: cookie is definitely invalid ───────────
-                    if r.status_code in (401, 403):
-                        return "INVALID", r.text
-
-                    # ── Login page: might be blocked proxy, not bad cookie ───
-                    if _is_login_page(r.url, r.text):
-                        if cur_proxy and _proxy_manager and not login_page_retried:
-                            # Soft-fail the proxy and try once more with a new one
-                            _proxy_manager.mark_failure(_proxy_url(cur_proxy))
-                            login_page_retried = True
-                            if attempt < max_attempts - 1:
-                                continue
-                        return "INVALID", r.text
-
-                    # ── Success ──────────────────────────────────────────────
-                    if r.status_code == 200 and len(r.text) > 1000:
-                        if cur_proxy and _proxy_manager:
-                            _proxy_manager.mark_success(_proxy_url(cur_proxy))
-                        return "OK", r.text
-
-                    break   # non-200, non-rate-limit → try next URL
-
-                except Exception as exc:
-                    logger.debug("_fetch_account attempt %d error: %s", attempt, exc)
-                    if cur_proxy and _proxy_manager:
-                        _proxy_manager.mark_failure(_proxy_url(cur_proxy), hard=True)
-                    if attempt < max_attempts - 1:
+            with _cf.ThreadPoolExecutor(max_workers=len(proxies)) as rpool:
+                futs = {rpool.submit(_one_attempt, p, url): p for p in proxies}
+                login_hits = 0
+                last_login_html = ""
+                for fut in _cf.as_completed(futs, timeout=_timeout + 1):
+                    try:
+                        status, html = fut.result()
+                    except Exception:
                         continue
-                    break
+                    if status == "OK":
+                        return "OK", html
+                    if status == "INVALID":
+                        return "INVALID", html
+                    if status == "LOGIN":
+                        login_hits += 1
+                        last_login_html = html
+                        if login_hits >= len(proxies):
+                            # Every proxy saw a login page — cookie is invalid
+                            return "INVALID", last_login_html
+                    # FAIL → keep waiting for other futures
 
-        return "ERROR", ""
+            # All proxies failed → one direct attempt as last resort
+            return _one_attempt(None, url)
+
+        if _proxy_active:
+            status, html = _race("https://www.netflix.com/account/membership")
+            if status == "OK":
+                return "OK", html
+            if status == "INVALID":
+                return "INVALID", html
+            # Soft-fail on membership page → try browse as backup (single mode only)
+            if not bulk_mode:
+                status, html = _race("https://www.netflix.com/browse")
+                if status in ("OK", "INVALID"):
+                    return status, html
+            return "ERROR", ""
+
+        else:
+            # Direct mode — no proxies
+            url = "https://www.netflix.com/account/membership"
+            status, html = _one_attempt(None, url)
+            if status in ("OK", "INVALID"):
+                return status, html
+            if not bulk_mode:
+                status, html = _one_attempt(None, "https://www.netflix.com/browse")
+                if status in ("OK", "INVALID"):
+                    return status, html
+            return "ERROR", ""
 
     def _fetch_nftoken():
         return generate_nftoken(cookies)
