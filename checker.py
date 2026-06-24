@@ -981,31 +981,47 @@ def _extract_email_verified(html: str) -> bool | None:
 # Main cookie checker
 # ---------------------------------------------------------------------------
 
+_tl_session = _threading.local()
+
+
+def _get_pooled_session() -> tuple:
+    """
+    Return a thread-local reusable session (curl_cffi or requests).
+    Reusing sessions avoids repeated TLS handshake overhead — major speed win
+    when checking many cookies in parallel worker threads.
+    Returns (session, using_curl).
+    """
+    if not getattr(_tl_session, "session", None):
+        if _CURL_AVAILABLE:
+            s = _curl_requests.Session(impersonate="chrome124")
+            s.headers.update(BROWSER_HEADERS)
+            _tl_session.session = s
+            _tl_session.using_curl = True
+        else:
+            s = requests.Session()
+            s.headers.update(BROWSER_HEADERS)
+            _retries = requests.adapters.Retry(
+                total=0,
+                backoff_factor=0,
+                status_forcelist=[500, 502, 503, 504],
+            )
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=8, pool_maxsize=16, max_retries=_retries
+            )
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            _tl_session.session = s
+            _tl_session.using_curl = False
+    return _tl_session.session, _tl_session.using_curl
+
+
 def _make_session(bulk_mode: bool):
     """
-    Create an HTTP session with Chrome TLS fingerprinting (via curl_cffi) or
-    fall back to a hardened requests.Session if curl_cffi is unavailable.
-    Returns (session, using_curl).
-    Proxy is NOT baked into the session — each request fetches a fresh proxy
-    so retries automatically use a different IP if the previous one failed.
+    Return a pooled thread-local session.
+    Sessions are reused across calls in the same thread to avoid repeated
+    TLS handshake overhead.
     """
-    if _CURL_AVAILABLE:
-        s = _curl_requests.Session(impersonate="chrome124")
-        s.headers.update(BROWSER_HEADERS)
-        return s, True
-    s = requests.Session()
-    s.headers.update(BROWSER_HEADERS)
-    _retries = requests.adapters.Retry(
-        total=0,
-        backoff_factor=0,
-        status_forcelist=[500, 502, 503, 504],
-    )
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=4, pool_maxsize=8, max_retries=_retries
-    )
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s, False
+    return _get_pooled_session()
 
 
 def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool = False) -> dict:
@@ -1045,7 +1061,12 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
             "message": f"No Netflix session cookies found. Got: {', '.join(list(cookies.keys())[:8])}",
         }
 
-    _timeout = 5 if bulk_mode else 7
+    # Separate timeouts: proxy attempts use a shorter timeout so dead/slow proxies
+    # are discarded fast and we fall through to direct sooner.
+    # Direct attempts keep a longer timeout for reliability.
+    _proxy_timeout  = 3 if bulk_mode else 4   # seconds per proxy attempt
+    _direct_timeout = 5 if bulk_mode else 7   # seconds for direct attempt
+    _timeout = _direct_timeout                # used by NFToken and legacy paths
     session, using_curl = _make_session(bulk_mode)
 
     # ── Fetch membership page (+ optional parallel NFToken) ───────────────────
@@ -1063,18 +1084,21 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
         Direct mode: single attempt (bulk) or two sequential (single).
         """
         _proxy_active = _PROXY_ENABLED and _proxy_manager and _proxy_manager.enabled
-        RACE_N = 3  # proxies to race in parallel
+        RACE_N = 4  # proxies to race in parallel — balanced: speed vs rate-limit risk
 
         def _purl(pd):
             return (pd.get("https") or pd.get("http") or "") if pd else ""
 
         def _one_attempt(proxy_dict, url):
-            """Single HTTP request. Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html)."""
+            """Single HTTP request. Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html).
+            Uses _proxy_timeout for proxy requests, _direct_timeout for direct.
+            """
+            t = _proxy_timeout if proxy_dict else _direct_timeout
             try:
                 r = session.get(
                     url,
                     cookies=cookies,
-                    timeout=_timeout,
+                    timeout=t,
                     allow_redirects=True,
                     **({"proxies": proxy_dict} if proxy_dict else {}),
                 )
@@ -1103,34 +1127,39 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
             """
             Race RACE_N proxies simultaneously; return first OK/INVALID result.
             Falls back to direct if all proxies fail.
+            Race timeout = _proxy_timeout + 0.5s so we don't wait the full
+            direct timeout before falling through to the direct fallback.
             """
             proxies = [_proxy_manager.get_proxies_dict() for _ in range(RACE_N)]
             proxies = [p for p in proxies if p]
             if not proxies:
                 return _one_attempt(None, url)
 
+            race_timeout = _proxy_timeout + 0.5
             with _cf.ThreadPoolExecutor(max_workers=len(proxies)) as rpool:
                 futs = {rpool.submit(_one_attempt, p, url): p for p in proxies}
                 login_hits = 0
                 last_login_html = ""
-                for fut in _cf.as_completed(futs, timeout=_timeout + 1):
-                    try:
-                        status, html = fut.result()
-                    except Exception:
-                        continue
-                    if status == "OK":
-                        return "OK", html
-                    if status == "INVALID":
-                        return "INVALID", html
-                    if status == "LOGIN":
-                        login_hits += 1
-                        last_login_html = html
-                        if login_hits >= len(proxies):
-                            # Every proxy saw a login page — cookie is invalid
-                            return "INVALID", last_login_html
-                    # FAIL → keep waiting for other futures
+                try:
+                    for fut in _cf.as_completed(futs, timeout=race_timeout):
+                        try:
+                            status, html = fut.result()
+                        except Exception:
+                            continue
+                        if status == "OK":
+                            return "OK", html
+                        if status == "INVALID":
+                            return "INVALID", html
+                        if status == "LOGIN":
+                            login_hits += 1
+                            last_login_html = html
+                            if login_hits >= len(proxies):
+                                return "INVALID", last_login_html
+                        # FAIL → keep waiting for other futures
+                except _cf.TimeoutError:
+                    pass  # all proxies timed out → fall through to direct
 
-            # All proxies failed → one direct attempt as last resort
+            # All proxies failed/timed out → one direct attempt as last resort
             return _one_attempt(None, url)
 
         if _proxy_active:

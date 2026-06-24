@@ -80,9 +80,8 @@ COOKIE_MIME_TYPES = {
     "application/octet-stream", "text/csv",
 }
 
-# Keep concurrency moderate — too many parallel requests to Netflix triggers
-# IP-level rate limiting (429) and causes valid cookies to show as errors.
-BULK_CONCURRENCY = 16
+# Concurrency for bulk checks — 24 gives good throughput without heavy 429s.
+BULK_CONCURRENCY = 24
 
 _CANCEL_SESSIONS: set[int] = set()
 # Maps uid → epoch timestamp when the session started.
