@@ -72,7 +72,7 @@ def is_admin(uid: int) -> bool:
 _PROXY_ADD_STATE: set[int] = set()     # admin is typing a single proxy line
 _PROXY_SOURCE_STATE: set[int] = set()  # admin is typing a source URL to import from
 
-_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+_EXECUTOR = ThreadPoolExecutor(max_workers=48)
 
 COOKIE_EXTENSIONS = (".txt", ".json", ".cookie", ".cookies")
 COOKIE_MIME_TYPES = {
@@ -80,8 +80,8 @@ COOKIE_MIME_TYPES = {
     "application/octet-stream", "text/csv",
 }
 
-# Concurrency for bulk checks — 24 gives good throughput without heavy 429s.
-BULK_CONCURRENCY = 24
+# High concurrency — proxies rotate IPs so 429s are spread across different IPs.
+BULK_CONCURRENCY = 32
 
 _CANCEL_SESSIONS: set[int] = set()
 # Maps uid → epoch timestamp when the session started.
@@ -2776,8 +2776,8 @@ async def process_cookie_sets(
                     pass
 
         if is_bulk:
-            # Brief inter-batch pause reduces Netflix IP-level rate limiting.
-            await asyncio.sleep(0.15)
+            # Tiny yield so the event loop stays responsive; proxies handle IP rotation.
+            await asyncio.sleep(0)
 
     # ── Retry errored accounts once (full timeout, not bulk-mode) ─────────────
     if is_bulk and error_retry:

@@ -1061,10 +1061,9 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
             "message": f"No Netflix session cookies found. Got: {', '.join(list(cookies.keys())[:8])}",
         }
 
-    # Separate timeouts: proxy attempts use a shorter timeout so dead/slow proxies
-    # are discarded fast and we fall through to direct sooner.
-    # Direct attempts keep a longer timeout for reliability.
-    _proxy_timeout  = 3 if bulk_mode else 4   # seconds per proxy attempt
+    # Proxy timeout is very short so dead/slow proxies fail fast.
+    # Direct timeout is kept reasonable for reliability.
+    _proxy_timeout  = 2 if bulk_mode else 3   # seconds per proxy attempt
     _direct_timeout = 5 if bulk_mode else 7   # seconds for direct attempt
     _timeout = _direct_timeout                # used by NFToken and legacy paths
     session, using_curl = _make_session(bulk_mode)
@@ -1084,7 +1083,7 @@ def check_cookie(cookie_text: str, generate_token: bool = True, bulk_mode: bool 
         Direct mode: single attempt (bulk) or two sequential (single).
         """
         _proxy_active = _PROXY_ENABLED and _proxy_manager and _proxy_manager.enabled
-        RACE_N = 4  # proxies to race in parallel — balanced: speed vs rate-limit risk
+        RACE_N = 6  # race 6 proxies at once — more chances of a fast one
 
         def _purl(pd):
             return (pd.get("https") or pd.get("http") or "") if pd else ""
